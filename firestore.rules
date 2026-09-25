@@ -1,0 +1,283 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* =========================
+       Common helpers
+       ========================= */
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status != 'BANNED';
+    }
+
+    function isActiveUser() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status != 'BANNED'
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status != 'DISABLED';
+    }
+
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    function validTimestamp(field) {
+      return request.resource.data[field] == request.time
+        || request.resource.data[field] is timestamp;
+    }
+
+    /* =========================
+       User profiles
+       ========================= */
+    match /users/{uid} {
+      // Needed by the app for login/profile rendering and admin lookup.
+      allow read: if isOwner(uid) || isAdmin();
+
+      // A user can create only their own initial, non-privileged profile.
+      allow create: if isOwner(uid)
+        && request.resource.data.role == 'user'
+        && request.resource.data.status == 'ACTIVE'
+        && request.resource.data.walletBalance == 0
+        && request.resource.data.walletBalanceSAR == 0
+        && request.resource.data.walletBalanceUSD == 0
+        && request.resource.data.keys().hasOnly([
+          'email', 'photoURL', 'walletBalance', 'walletBalanceSAR',
+          'walletBalanceUSD', 'role', 'status', 'userCode', 'publicUserId',
+          'createdAt'
+        ]);
+
+      // Users may edit profile/preferences only. Wallet, role and status are privileged.
+      allow update: if isOwner(uid)
+        && onlyChanges([
+          'email', 'displayName', 'username', 'bio', 'phone', 'dateOfBirth',
+          'region', 'preferredCurrency', 'favoriteGame', 'defaultPlayerId',
+          'notificationPrefs', 'privacyPrefs', 'photoURL',
+          'updatedAt'
+        ])
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.status == resource.data.status
+        && request.resource.data.walletBalance == resource.data.walletBalance
+        && request.resource.data.walletBalanceSAR == resource.data.walletBalanceSAR
+        && request.resource.data.walletBalanceUSD == resource.data.walletBalanceUSD;
+
+      // Admin can manage profiles and financial/status fields.
+      allow update, delete: if isAdmin();
+    }
+
+    /* Public lookup used by the referral-code flow. */
+    match /userCodes/{code} {
+      allow read: if true;
+      allow create: if isActiveUser()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.code == code
+        && !exists(/databases/$(database)/documents/userCodes/$(code));
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    /* =========================
+       Public catalogue/configuration
+       ========================= */
+    match /products/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /items/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /packages/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /categories/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /banners/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /paymentMethods/{id} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /settings/{settingId} {
+      // The HTML reads these settings before and after login.
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /globalNotifications/{id} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    /* =========================
+       Orders
+       ========================= */
+    match /orders/{orderId} {
+      allow read: if isAdmin()
+        || (isActiveUser() && resource.data.userId == request.auth.uid);
+
+      // The createOrder callable creates orders using Admin SDK.
+      // Direct browser order creation is intentionally blocked.
+      allow create: if isAdmin();
+
+      // Only an admin/backend may change status, refunds or completion data.
+      allow update, delete: if isAdmin();
+    }
+
+    /* =========================
+       Deposits
+       ========================= */
+    match /deposits/{depositId} {
+      allow read: if isAdmin()
+        || (isActiveUser() && resource.data.userId == request.auth.uid);
+
+      allow create: if isActiveUser()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.currency in ['BDT', 'SAR', 'USD'];
+
+      // Approval/rejection and approvedAmount are admin/backend-only.
+      allow update, delete: if isAdmin();
+    }
+
+    /* =========================
+       Per-user notifications
+       ========================= */
+    match /notifications/{notificationId} {
+      allow read: if isAdmin()
+        || (isActiveUser() && resource.data.userId == request.auth.uid);
+
+      // App creates its own order/deposit pending notifications.
+      allow create: if isActiveUser()
+        && request.resource.data.userId == request.auth.uid;
+
+      // A user may mark/delete only their own notification; content cannot be changed.
+      allow update: if isActiveUser()
+        && resource.data.userId == request.auth.uid
+        && onlyChanges(['read', 'updatedAt']);
+
+      allow delete: if isAdmin()
+        || (isActiveUser() && resource.data.userId == request.auth.uid);
+    }
+
+    /* =========================
+       Chat
+       ========================= */
+    match /chatMessages/{messageId} {
+      // Queries in the HTML are broad; authenticated users can read chat messages.
+      // If private chat confidentiality is required, replace this with a backend
+      // query design that filters by participant IDs.
+      allow read: if isActiveUser();
+
+      allow create: if isActiveUser()
+        && request.resource.data.userId is string
+        && request.resource.data.message is string
+        && request.resource.data.message.size() > 0
+        && request.resource.data.message.size() <= 5000
+        && (
+          (request.resource.data.role == 'admin' && isAdmin()
+            && request.resource.data.senderId == request.auth.uid)
+          || (request.resource.data.role == 'user'
+            && request.resource.data.userId == request.auth.uid)
+        );
+
+      allow update: if isAdmin()
+        || (isActiveUser()
+          && resource.data.userId == request.auth.uid
+          && onlyChanges(['readByUser', 'updatedAt']));
+
+      allow delete: if isAdmin();
+    }
+
+    /* =========================
+       Coupons and redemption history
+       ========================= */
+    match /coupons/{code} {
+      allow read: if isActiveUser();
+      allow write: if isAdmin();
+    }
+
+    match /couponRedemptions/{redemptionId} {
+      allow read: if isAdmin()
+        || (isActiveUser() && resource.data.userId == request.auth.uid);
+
+      // Client redemption is intentionally blocked because it changes wallet money.
+      allow create, update, delete: if isAdmin();
+    }
+
+    /* =========================
+       Wallet ledger
+       ========================= */
+    match /walletTransactions/{transactionId} {
+      allow read: if isAdmin()
+        || (isActiveUser() && resource.data.userId == request.auth.uid);
+
+      // Every ledger entry and balance change must come from trusted backend/admin.
+      allow create, update, delete: if isAdmin();
+    }
+
+    /* =========================
+       Referral records
+       ========================= */
+    match /referrals/{refereeUid} {
+      allow read: if isAdmin()
+        || (isActiveUser() && resource.data.referrerUid == request.auth.uid)
+        || (isActiveUser() && refereeUid == request.auth.uid);
+
+      // Linking a referral changes user relationships; use a trusted backend.
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /referralBonuses/{bonusId} {
+      allow read: if isAdmin()
+        || (isActiveUser() && resource.data.referrerUid == request.auth.uid);
+      allow create, update, delete: if isAdmin();
+    }
+
+    /* =========================
+       Admin-only operational collections
+       ========================= */
+    match /auditLogs/{id} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.adminUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /supportMessages/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    match /suppliers/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    /* No undeclared collection or subcollection is accessible. */
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
